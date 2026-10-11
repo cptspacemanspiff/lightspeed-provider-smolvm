@@ -1,0 +1,31 @@
+[package]
+name = "lightspeed-provider-smolvm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Lightspeed environment provider that runs environments as smolvm microVMs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+# Wire types for the controller and data planes. Path dependency on a sibling
+# Lightspeed checkout; switch to a pinned git dependency for CI or releases.
+environment-protocol = { path = "../lightspeed/crates/environment-protocol" }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "lightspeed-provider-smolvm"
+path = "src/main.rs"
