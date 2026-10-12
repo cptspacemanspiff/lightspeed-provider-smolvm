@@ -124,6 +124,23 @@ frames are never logged.
 Register it in Lightspeed under **Environment providers → Register provider**
 with transport `WebSocket` and endpoint `ws://<host>:19190/control`.
 
+## Docker
+
+`docker/` holds an image and a Compose service for it. The image compiles
+nothing: `docker/stage` builds the provider and a static envd (from
+`../lightspeed`, `LIGHTSPEED_DIR`) on the host and copies them, with the host's
+smolvm install, into `docker/dist/`. The entrypoint adds the image's envd to
+the config mounted at `/etc/lightspeed/smolvm-provider.json`.
+
+```bash
+docker/stage && docker compose -f docker/compose.yaml build
+```
+
+`docker/compose.yaml` passes `/dev/kvm` through and adds its group (`KVM_GID`).
+It leaves out the published port, the config and the `/data` mount (smolvm's
+machines and the provider's state), for a project to add by `extends`.
+[lightspeed-integration](../lightspeed-integration) does this.
+
 ## Status
 
 The controller logic, store, reconciliation, channel and credential rewriting

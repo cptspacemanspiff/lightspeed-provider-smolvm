@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Build the provider and a static envd on the host, and copy them with the
+# host's smolvm install into the image's build context, docker/dist/:
+#
+#   dist/bin/lightspeed-provider-smolvm   built here (cargo build --release)
+#   dist/envd/lightspeed-envd-<arch>-<sha>, envd.json
+#                                         from ../lightspeed (build-envd.sh)
+#   dist/smolvm/                          the smolvm install: wrapper, binary,
+#                                         lib/, disk templates, agent-rootfs/
+#
+# envd.json is the config's envd section with the path the image puts envd
+# at. Rerun after changing the provider, envd or smolvm, then rebuild.
+#
+# LIGHTSPEED_DIR overrides the Lightspeed checkout envd is built from (default:
+# the sibling ../lightspeed), SMOLVM_HOME the smolvm install (default:
+# ~/.smolvm).
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+provider=$(cd "$here/.." && pwd)
+lightspeed=${LIGHTSPEED_DIR:-$(cd "$provider/.." && pwd)/lightspeed}
+smolvm_home=${SMOLVM_HOME:-$HOME/.smolvm}
+rootfs=${SMOLVM_AGENT_ROOTFS:-${XDG_DATA_HOME:-$HOME/.local/share}/smolvm/agent-rootfs}
+dist=$here/dist
+
+die() { echo "docker/stage: $*" >&2; exit 1; }
+
+[ -d "$lightspeed" ] || die "$lightspeed not found (set LIGHTSPEED_DIR)"
+for f in smolvm smolvm-bin lib storage-template.ext4.zst overlay-template.ext4.zst; do
+    [ -e "$smolvm_home/$f" ] || die "not found: $smolvm_home/$f (install smolvm, or set SMOLVM_HOME)"
+done
+[ -x "$rootfs/usr/local/bin/smolvm-agent" ] || die "no agent rootfs at $rootfs (set SMOLVM_AGENT_ROOTFS)"
+
+rm -rf "$dist"
+mkdir -p "$dist/bin" "$dist/envd" "$dist/smolvm"
+
+# In the checkout, so its rust-toolchain.toml picks the toolchain.
+echo "==> building lightspeed-provider-smolvm"
+(cd "$provider" && cargo build --quiet --release --bin lightspeed-provider-smolvm)
+cp "$provider/target/release/lightspeed-provider-smolvm" "$dist/bin/"
+
+build=$(mktemp -d)
+trap 'rm -rf "$build"' EXIT
+LIGHTSPEED_DIR=$lightspeed OUT_DIR=$build "$provider/scripts/build-envd.sh" >/dev/null
+envd=$(cd "$build" && ls lightspeed-envd-*)
+cp "$build/$envd" "$dist/envd/"
+arch=$(uname -m)
+sha=$(sha256sum "$dist/envd/$envd" | cut -d' ' -f1)
+cat >"$dist/envd/envd.json" <<EOF
+{ "binaries": { "$arch": { "path": "/opt/lightspeed/envd/$envd", "sha256": "$sha" } } }
+EOF
+
+# The compressed templates only: smolvm expands them into its cache on first
+# use, and the expanded ones are 30 GiB of (sparse) files.
+cp -a "$smolvm_home/smolvm" "$smolvm_home/smolvm-bin" "$smolvm_home/lib" \
+    "$smolvm_home/storage-template.ext4.zst" "$smolvm_home/overlay-template.ext4.zst" \
+    "$dist/smolvm/"
+# Beside the wrapper, which then points SMOLVM_AGENT_ROOTFS at it.
+cp -a "$rootfs" "$dist/smolvm/agent-rootfs"
+
+echo "smolvm: $(cat "$smolvm_home/.version" 2>/dev/null || echo unknown)"
+echo "envd: $envd"
+echo "Staged $dist"

@@ -1,0 +1,42 @@
+# The provider as a Compose service, for a project to extend with its own
+# port, config and data mount:
+#
+#   services:
+#     smolvm-provider:
+#       extends: {file: ../lightspeed-provider-smolvm/docker/compose.yaml, service: smolvm-provider}
+#       ports: ["127.0.0.1:19190:19190"]
+#       volumes:
+#         - ./provider.json:/etc/lightspeed/smolvm-provider.json:ro
+#         - ${HOME}/.local/share/lightspeed-smolvm-provider:/data
+#
+# The config needs no envd section: the entrypoint adds the image's. Run
+# docker/stage first: the image copies the host-built provider, envd and smolvm
+# from dist/ rather than compiling anything.
+services:
+  smolvm-provider:
+    build: .
+    image: lightspeed-provider-smolvm:dev
+    # Reaps the VMM processes smolvm detaches for each machine.
+    init: true
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # smolvm runs microVMs with KVM. KVM_GID is /dev/kvm's group on the host,
+    # since the image has no kvm group of its own.
+    devices:
+      - /dev/kvm
+    group_add:
+      - "${KVM_GID:-kvm}"
+    # Publish the controller endpoint only. envd is reached over sockets in
+    # /data, never the network.
+    expose:
+      - "19190"
+    # HOME is /data: smolvm's machine database, image cache and VM disks, and
+    # the provider's ownership store, sockets and secret files. Stopping the
+    # container stops its machines; the provider reconciles them on its next
+    # start.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:19190/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
