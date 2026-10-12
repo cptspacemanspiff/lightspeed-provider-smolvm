@@ -15,7 +15,7 @@ Lightspeed ──ws /routes/{u}/{b}/{e}/{i}/{t}─▶ provider
                      <stateDir>/vms/<target>/envd.sock   (host AF_UNIX, 0700 dir)
                                           │ smolvm --expose-socket (vsock bridge)
                                           ▼
-                     lightspeed-envd on /run/lightspeed/envd.sock in the guest
+                     lightspeed-envd on /var/lib/lightspeed-envd/envd.sock in the guest
 ```
 
 - **The provider is the only network-facing component.** Lightspeed never
@@ -53,19 +53,73 @@ On startup the provider reconciles its store with `smolvm machine ls --json`:
 - A machine without a record is re-recorded from its labels.
 - A machine without usable labels is reported and left alone.
 
+## envd injection
+
+Templates use ordinary OCI images (`ubuntu`, `alpine`, a project's own dev
+image) with no `lightspeed-envd` installed. The provider supplies it:
+
+- `envd.binaries` in the config names a **static (musl)** envd per guest
+  architecture, pinned by sha256. Only `x86_64` is supported so far.
+- At startup the provider verifies the hash and copies the binary to
+  `<stateDir>/envd/<sha256>/lightspeed-envd`. Published directories are
+  never modified, and ones no machine references are removed at startup.
+- Each machine mounts that directory read-only at `/opt/lightspeed-envd`
+  and runs envd as its workload command, so envd sees the image's
+  filesystem and the processes it starts inherit smolvm's credential
+  placeholders.
+- envd runs as a dedicated unprivileged `lightspeed-envd` user (home and
+  state directory `/var/lib/lightspeed-envd`), created on first start by an
+  init command the provider adds before the template's own `init`. Agent
+  commands run as that user, so its access is the agent's access.
+  `"envdUser": "root"` skips the user; the microVM is then the only
+  isolation boundary.
+- A machine keeps the envd it was created with, since smolvm reuses the
+  create-time mount on every restart. To upgrade envd, create new machines.
+  envd's `upgrade` subcommand fails on the read-only mount, by design.
+
+Image requirements: a Linux userland with `/bin/sh` (envd runs commands
+through it), `useradd` or BusyBox `adduser` unless `envdUser` is `root`, and
+whatever tools agents need. envd itself needs no particular libc.
+
+A template with `"envdSource": "image"` instead starts an envd the image
+ships, through its own `command`.
+
+To build envd for local use (needs `musl-tools` and the
+`x86_64-unknown-linux-musl` Rust target):
+
+```bash
+./scripts/build-envd.sh     # writes out/lightspeed-envd-x86_64-<sha> and out/provider.json
+cargo run -- --config out/provider.json
+```
+
 ## Configuration
 
 See [config.example.json](config.example.json). Notes:
 - Images must be pinned by digest.
-- `stateDir` must be absolute and short (AF_UNIX path limits).
+- `envd.binaries.<arch>` must be set when any template injects envd.
+- `stateDir` is optional. It defaults to
+  `~/.local/state/lightspeed-provider-smolvm` (or `$XDG_STATE_HOME/...`,
+  `%LOCALAPPDATA%\...` on Windows). It must be absolute, at most 64 bytes
+  (AF_UNIX path limits), and owned by the user running the provider. That
+  must be the same user that owns the smolvm machines, because smolvm keeps
+  its machine database per user.
 - Templates opt in to credential rules by name.
 - `envd.kind` is `exposedSocket` (preferred) or `loopbackForward`
   (development only).
 
+`config.example.json` points at a placeholder envd path and hash, so it
+won't start as is. Run the config `scripts/build-envd.sh` writes instead:
+
 ```bash
-cargo run -- --config config.example.json
+cargo run -- --config out/provider.json
 curl http://127.0.0.1:19190/health
 ```
+
+Logs go to stdout. `RUST_LOG` sets the level (default `info`; `debug` adds
+every smolvm command with its duration and stderr, plus per-RPC timings).
+`--log-format json` (or `LIGHTSPEED_SMOLVM_PROVIDER_LOG_FORMAT=json`) prints
+one JSON object per line for a log collector. Credential values and data
+frames are never logged.
 
 Register it in Lightspeed under **Environment providers → Register provider**
 with transport `WebSocket` and endpoint `ws://<host>:19190/control`.
@@ -75,12 +129,11 @@ with transport `WebSocket` and endpoint `ws://<host>:19190/control`.
 The controller logic, store, reconciliation, channel and credential rewriting
 are unit tested. Nothing has run against a real smolvm yet. Before it can:
 
-1. **envd Unix-socket listener.** envd only listens on TCP today. The
-   `exposedSocket` channel needs a `--listen-unix <path>` option in
-   `crates/environment-daemon`. Until then, use `loopbackForward`, but note
-   that smolvm chooses the host bind address for published ports.
-2. **Guest image.** Build an OCI image with `lightspeed-envd` and publish it
-   by digest. Apple Silicon hosts need an aarch64 Linux envd.
+1. **envd Unix-socket listener.** Needs Lightspeed's `envd-unix-listener`
+   branch (`--listen unix:///<path>`) until it merges.
+2. **First real run.** Check injected envd end to end on `ubuntu` and
+   `alpine`: user creation, socket access from smolvm's namespace helper
+   with envd's 0600 socket, and restarts keeping the same envd.
 3. **Placeholder inheritance.** smolvm injects credential placeholders into
    the workload environment. envd must be that workload (the template
    `command`) so the processes it starts inherit them. Check this end to end.

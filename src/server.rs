@@ -6,6 +6,8 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use anyhow::Context as _;
+
 use axum::{
     Json, Router,
     extract::{
@@ -21,6 +23,7 @@ use environment_protocol::{
         handshake::{
             ControllerCapabilities, ControllerInitializeParams, ControllerInitializeResponse,
         },
+        ingress::{IngressResponse, ProviderIngressStatus, RemoveIngressParams},
         methods::*,
         targets::*,
     },
@@ -33,11 +36,13 @@ use environment_protocol::{
 use futures_util::{StreamExt as _, stream};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 use crate::{
     backend::{VmBackend, VmSpec, VmState},
     channel,
-    config::{Config, EnvdChannel},
+    config::{Config, EnvdChannel, EnvdSource},
+    envd::{self, EnvdMount},
     policy,
     relay::{self, RelayContext},
     store::{Lifecycle, Store, TargetRecord, now_ms},
@@ -118,6 +123,7 @@ async fn control_upgrade<B: VmBackend>(
 }
 
 async fn control_connection<B: VmBackend>(app: App<B>, mut socket: WebSocket) {
+    tracing::info!("control connection opened");
     while let Some(Ok(message)) = socket.recv().await {
         match message {
             Message::Text(text) => {
@@ -138,6 +144,7 @@ async fn control_connection<B: VmBackend>(app: App<B>, mut socket: WebSocket) {
         }
     }
     let _ = socket.send(Message::Close(None)).await;
+    tracing::info!("control connection closed");
 }
 
 async fn data_upgrade<B: VmBackend>(
@@ -151,13 +158,22 @@ async fn data_upgrade<B: VmBackend>(
     )>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let reject = |status: StatusCode, reason: &str| {
+        tracing::warn!(%target_id, %status, reason, "data route rejected");
+        status.into_response()
+    };
     if policy::target_name(&universe, &binding_id, &environment, &incarnation) != target_id {
-        return StatusCode::CONFLICT.into_response();
+        return reject(StatusCode::CONFLICT, "route does not match target identity");
     }
     let record = match app.store.get(&target_id).await {
         Ok(Some(record)) => record,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(None) => return reject(StatusCode::NOT_FOUND, "no such target"),
+        Err(error) => {
+            return reject(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("store read failed: {error:#}"),
+            );
+        }
     };
     let binding = ProviderBindingContext {
         universe_id: universe,
@@ -167,21 +183,35 @@ async fn data_upgrade<B: VmBackend>(
         || record.environment_id != environment
         || record.incarnation_id != incarnation
     {
-        return StatusCode::CONFLICT.into_response();
+        return reject(
+            StatusCode::CONFLICT,
+            "target ownership does not match route",
+        );
     }
     if record.lifecycle != Lifecycle::Active {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("target is {:?}", record.lifecycle),
+        );
     }
-    let Ok(vm_dir) = app.store.vm_dir(&record.target_id) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let vm_dir = match app.store.vm_dir(&record.target_id) {
+        Ok(vm_dir) => vm_dir,
+        Err(error) => return reject(StatusCode::INTERNAL_SERVER_ERROR, &format!("{error:#}")),
     };
-    let Ok(endpoint) = channel::endpoint(&record, &vm_dir) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let endpoint = match channel::endpoint(&record, &vm_dir) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return reject(StatusCode::INTERNAL_SERVER_ERROR, &format!("{error:#}")),
     };
     let guest = match channel::dial(&endpoint, app.dial_timeout()).await {
         Ok(guest) => guest,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            return reject(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("envd dial failed: {error:#}"),
+            );
+        }
     };
+    tracing::info!(%target_id, ?endpoint, "data route opened");
     let context = RelayContext {
         backend: app.backend.clone(),
         rules: Arc::new(app.config.template_rules(&record.template_id)),
@@ -189,9 +219,10 @@ async fn data_upgrade<B: VmBackend>(
         idle: Duration::from_secs(app.config.relay_idle_seconds),
         target_id: record.target_id,
     };
+    let span = tracing::info_span!("relay", target_id = %context.target_id);
     upgrade
         .max_message_size(64 * 1024 * 1024)
-        .on_upgrade(move |socket| relay::proxy(context, socket, guest))
+        .on_upgrade(move |socket| relay::proxy(context, socket, guest).instrument(span))
         .into_response()
 }
 
@@ -199,6 +230,7 @@ async fn dispatch<B: VmBackend>(app: &App<B>, text: &str) -> Value {
     let request: Value = match serde_json::from_str(text) {
         Ok(value) => value,
         Err(error) => {
+            tracing::warn!(%error, "malformed control request");
             return error_value(
                 Value::Null,
                 EnvironmentProtocolErrorCode::InvalidRequest,
@@ -212,6 +244,24 @@ async fn dispatch<B: VmBackend>(app: &App<B>, text: &str) -> Value {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    // Params are not logged whole: create requests can carry secret values.
+    let target_id = params
+        .get("targetId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let span = tracing::info_span!("rpc", %method, %id, target_id = target_id.as_deref());
+    let started = std::time::Instant::now();
+    let response = call(app, method, id, params).instrument(span.clone()).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let _entered = span.enter();
+    match response.get("error") {
+        None => tracing::debug!(elapsed_ms, "rpc ok"),
+        Some(error) => tracing::warn!(elapsed_ms, error = %error, "rpc failed"),
+    }
+    response
+}
+
+async fn call<B: VmBackend>(app: &App<B>, method: &str, id: Value, params: Value) -> Value {
     let result = match method {
         INITIALIZE_METHOD => initialize(decode(params)).and_then(encode),
         LIST_TEMPLATES_METHOD => list_templates(app, decode(params)).and_then(encode),
@@ -220,7 +270,8 @@ async fn dispatch<B: VmBackend>(app: &App<B>, text: &str) -> Value {
         GET_TARGET_METHOD => get_target(app, decode(params)).await.and_then(encode),
         CLOSE_TARGET_METHOD => close_target(app, decode(params)).await.and_then(encode),
         SET_TARGET_POWER_METHOD => set_target_power(app, decode(params)).await.and_then(encode),
-        ADOPT_TARGET_METHOD | ENSURE_INGRESS_METHOD | REMOVE_INGRESS_METHOD => {
+        REMOVE_INGRESS_METHOD => remove_ingress(decode(params)).and_then(encode),
+        ADOPT_TARGET_METHOD | ENSURE_INGRESS_METHOD => {
             return error_value(
                 id,
                 EnvironmentProtocolErrorCode::Unsupported,
@@ -363,6 +414,7 @@ async fn create_target<B: VmBackend>(
     };
     if let Some(record) = existing {
         verify_create(&record, &params)?;
+        tracing::info!(target_id = %record.target_id, "create retried; returning existing target");
         return Ok(CreateTargetResponse {
             target: summary_of(app, record).await,
         });
@@ -371,6 +423,16 @@ async fn create_target<B: VmBackend>(
     let host_port = match template.envd {
         EnvdChannel::LoopbackForward { .. } => Some(channel::allocate_loopback_port()?),
         EnvdChannel::ExposedSocket { .. } => None,
+    };
+    let envd = match template.envd_source {
+        EnvdSource::Injected => Some(EnvdMount::new(
+            app.config.state_dir(),
+            app.config
+                .envd_binary
+                .as_ref()
+                .context("no envd binary configured for this host")?,
+        )),
+        EnvdSource::Image => None,
     };
     let now = now_ms();
     let mut record = TargetRecord {
@@ -384,28 +446,45 @@ async fn create_target<B: VmBackend>(
         image: template.image.clone(),
         envd: template.envd.clone(),
         host_port,
+        envd_sha256: envd.as_ref().map(|mount| mount.sha256.clone()),
         lifecycle: Lifecycle::Creating,
         failure: None,
         created_at_ms: now,
         updated_at_ms: now,
     };
+    tracing::info!(
+        %target_id,
+        template_id = %template.template_id,
+        environment_id = %params.environment_id,
+        "creating target"
+    );
     // Record intent first: a crash after this leaves a known record for
     // reconciliation rather than an unowned machine.
     app.store.put(&record).await?;
     let vm_dir = app.store.ensure_vm_dir(&target_id).await?;
     let rules = app.config.template_rules(&template.template_id);
+    let mut labels = record.ownership().labels();
+    if let Some(sha256) = &record.envd_sha256 {
+        // Lets reconciliation keep the staged envd of a machine whose record
+        // was lost.
+        labels.insert(envd::LABEL_ENVD_SHA256.to_owned(), sha256.clone());
+    }
     let spec = VmSpec {
         name: &target_id,
         template,
         credentials: rules.values().collect(),
-        labels: record.ownership().labels(),
+        labels,
         vm_dir: &vm_dir,
         host_port,
+        envd,
     };
     let created = app.backend.create_and_start(&spec).await;
     record.updated_at_ms = now_ms();
     match created {
-        Ok(()) => record.lifecycle = Lifecycle::Active,
+        Ok(()) => {
+            tracing::info!(%target_id, "target active");
+            record.lifecycle = Lifecycle::Active;
+        }
         Err(error) => {
             tracing::warn!(%target_id, error = format!("{error:#}"), "machine creation failed");
             record.lifecycle = Lifecycle::Failed;
@@ -430,6 +509,7 @@ async fn close_target<B: VmBackend>(
         &params.target_id,
     )?;
     let Some(mut record) = app.store.get(params.target_id.as_str()).await? else {
+        tracing::info!(target_id = %params.target_id.as_str(), "close of unknown target; already closed");
         return Ok(CloseTargetResponse {
             target_id: params.target_id,
             status: ProviderTargetStatus::Closed,
@@ -441,14 +521,33 @@ async fn close_target<B: VmBackend>(
         &params.environment_id,
         &params.incarnation_id,
     )?;
+    tracing::info!(target_id = %record.target_id, "closing target");
     record.lifecycle = Lifecycle::Closing;
     record.updated_at_ms = now_ms();
     app.store.put(&record).await?;
     app.backend.delete(&record.target_id).await?;
     app.store.remove(&record.target_id).await?;
+    tracing::info!(target_id = %record.target_id, "target closed");
     Ok(CloseTargetResponse {
         target_id: params.target_id,
         status: ProviderTargetStatus::Closed,
+    })
+}
+
+/// This provider never enables ingress, so removal always succeeds.
+/// Lightspeed calls it before every `closeTarget`, whatever the advertised
+/// `ingress` capability, so refusing it would block closes.
+fn remove_ingress(params: anyhow::Result<RemoveIngressParams>) -> anyhow::Result<IngressResponse> {
+    let params = params?;
+    verify_target_handle(
+        &params.binding,
+        &params.environment_id,
+        &params.incarnation_id,
+        &params.target_id,
+    )?;
+    Ok(IngressResponse {
+        status: ProviderIngressStatus::Disabled,
+        public_endpoint: None,
     })
 }
 
@@ -475,6 +574,7 @@ async fn set_target_power<B: VmBackend>(
     }
     let name = record.target_id.as_str();
     let state = app.backend.state(name).await?;
+    tracing::info!(target_id = %name, from = ?state, to = %params.power, "setting target power");
     match (params.power, state) {
         (PowerState::Running, VmState::Running)
         | (PowerState::Suspended, VmState::Suspended)
@@ -561,8 +661,12 @@ async fn observe_status<B: VmBackend>(app: &App<B>, record: &TargetRecord) -> Pr
         Lifecycle::Failed => return ProviderTargetStatus::Failed,
         Lifecycle::Active => {}
     }
-    let Ok(state) = app.backend.state(&record.target_id).await else {
-        return ProviderTargetStatus::Unknown;
+    let state = match app.backend.state(&record.target_id).await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(target_id = %record.target_id, error = format!("{error:#}"), "could not read machine state");
+            return ProviderTargetStatus::Unknown;
+        }
     };
     match state {
         VmState::Running => {
@@ -573,6 +677,9 @@ async fn observe_status<B: VmBackend>(app: &App<B>, record: &TargetRecord) -> Pr
                 },
                 Err(_) => false,
             };
+            if !ready {
+                tracing::debug!(target_id = %record.target_id, "machine running but envd not answering yet");
+            }
             if ready {
                 ProviderTargetStatus::Ready
             } else {
@@ -712,6 +819,10 @@ mod tests {
         let machine = app.backend.machines.lock().unwrap()[name].clone();
         let ownership = policy::Ownership::from_labels(name, &machine.labels).unwrap();
         assert_eq!(ownership.request_id, "r1");
+        let sha256 = app.config.envd_binary.as_ref().unwrap().sha256.clone();
+        assert_eq!(machine.labels.get(envd::LABEL_ENVD_SHA256), Some(&sha256));
+        let record = app.store.get(name).await.unwrap().unwrap();
+        assert_eq!(record.envd_sha256, Some(sha256));
         assert!(app.store.secrets_dir(name).unwrap().is_dir());
     }
 
@@ -836,6 +947,38 @@ mod tests {
         assert_eq!(app.backend.state_of(name), VmState::Missing);
         assert!(app.store.get(name).await.unwrap().is_none());
         assert!(close_target(&app, Ok(close())).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn lightspeed_close_sequence_removes_ingress_then_closes() {
+        let (app, _dir) = app().await;
+        let created = create_target(&app, Ok(create_params("e", "r1")))
+            .await
+            .unwrap();
+        let target_id = created.target.target_id.as_str();
+        let handle = json!({
+            "requestId": "ingress-close:r1",
+            "environmentId": "e",
+            "incarnationId": "i",
+            "binding": {"universeId": "u", "bindingId": "b"},
+            "targetId": target_id,
+        });
+        let removed = call(&app, REMOVE_INGRESS_METHOD, handle.clone()).await;
+        assert_eq!(removed["result"]["status"], "disabled");
+        let mut close = handle;
+        close["requestId"] = "close:r1".into();
+        let closed = call(&app, CLOSE_TARGET_METHOD, close).await;
+        assert_eq!(closed["result"]["status"], "closed");
+        assert_eq!(app.backend.state_of(target_id), VmState::Missing);
+
+        let foreign = call(
+            &app,
+            REMOVE_INGRESS_METHOD,
+            json!({"requestId": "x", "environmentId": "other", "incarnationId": "i",
+                   "binding": {"universeId": "u", "bindingId": "b"}, "targetId": target_id}),
+        )
+        .await;
+        assert!(foreign.get("error").is_some());
     }
 
     #[tokio::test]

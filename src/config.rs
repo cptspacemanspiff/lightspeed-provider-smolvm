@@ -10,11 +10,21 @@ use anyhow::{Context as _, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+use crate::envd;
+
 #[derive(Parser, Debug)]
 #[command(name = "lightspeed-provider-smolvm", version)]
 pub struct ProviderArgs {
     #[arg(long, env = "LIGHTSPEED_SMOLVM_PROVIDER_CONFIG")]
     pub config: PathBuf,
+    /// Log line format on stdout.
+    #[arg(
+        long,
+        env = "LIGHTSPEED_SMOLVM_PROVIDER_LOG_FORMAT",
+        value_enum,
+        default_value_t
+    )]
+    pub log_format: crate::telemetry::LogFormat,
 }
 
 impl ProviderArgs {
@@ -30,9 +40,12 @@ impl ProviderArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawConfig {
     controller_listen: SocketAddr,
-    state_dir: PathBuf,
+    #[serde(default)]
+    state_dir: Option<PathBuf>,
     #[serde(default)]
     smolvm: SmolvmConfig,
+    #[serde(default)]
+    envd: EnvdConfig,
     templates: Vec<TemplatePolicy>,
     #[serde(default)]
     credentials: Vec<CredentialRule>,
@@ -59,6 +72,9 @@ pub struct ConfigInner {
     /// Absolute: smolvm reads secret files and serves envd sockets by path.
     pub state_dir: PathBuf,
     pub smolvm: SmolvmConfig,
+    /// The envd binary for this host's architecture, which `injected`
+    /// templates mount. Present whenever such a template exists.
+    pub envd_binary: Option<EnvdBinary>,
     pub templates: BTreeMap<String, TemplatePolicy>,
     /// Credential rules keyed by the environment-variable name Lightspeed
     /// binds (the `secretEnv` key).
@@ -94,6 +110,26 @@ fn default_command_timeout_seconds() -> u64 {
     120
 }
 
+/// envd binaries the provider injects, keyed by guest architecture
+/// (`std::env::consts::ARCH`; the guest's equals the host's).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnvdConfig {
+    #[serde(default)]
+    pub binaries: BTreeMap<String, EnvdBinary>,
+}
+
+/// A static (musl) `lightspeed-envd`, pinned by hash.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnvdBinary {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+/// Guest architectures an envd binary may be configured for.
+const ENVD_ARCHES: [&str; 2] = ["x86_64", "aarch64"];
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TemplatePolicy {
@@ -101,13 +137,31 @@ pub struct TemplatePolicy {
     pub display_name: String,
     #[serde(default)]
     pub description: Option<String>,
-    /// OCI image with `lightspeed-envd` installed, pinned by digest
-    /// (`name@sha256:...`) so a moved tag cannot change what a template creates.
+    /// A registry reference pinned by digest (`name@sha256:...`), or an
+    /// absolute path to a local `docker save` archive pinned by
+    /// `image_sha256`. Either way a moved tag or rewritten file cannot change
+    /// what a template creates. Any Linux image with `/bin/sh` works with an
+    /// injected envd.
     pub image: String,
-    /// Workload command (the image's entrypoint when empty). It must start
-    /// envd listening where `envd` says.
+    /// SHA-256 of the local archive in `image`; checked before each create.
+    #[serde(default)]
+    pub image_sha256: Option<String>,
+    /// Where envd comes from. Defaults to `injected`.
+    #[serde(default)]
+    pub envd_source: EnvdSource,
+    /// The user an injected envd runs as, and so the user agent commands run
+    /// as. Defaults to a dedicated unprivileged `lightspeed-envd` user.
+    #[serde(default)]
+    pub envd_user: EnvdUser,
+    /// Workload command, only for `envdSource: "image"` (the image's
+    /// entrypoint when empty). It must start envd listening where `envd`
+    /// says. An injected envd's command is generated.
     #[serde(default)]
     pub command: Vec<String>,
+    /// Commands run once, as root, on the machine's first start (smolvm
+    /// `--init`), after the provider's own envd user setup.
+    #[serde(default)]
+    pub init: Vec<String>,
     #[serde(default)]
     pub cpus: Option<u8>,
     #[serde(default)]
@@ -122,6 +176,29 @@ pub struct TemplatePolicy {
     pub credentials: Vec<String>,
     #[serde(default)]
     pub deprecated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvdSource {
+    /// The provider mounts its staged envd read-only into the machine and
+    /// runs it as the workload. The image needs no envd.
+    #[default]
+    Injected,
+    /// The image ships envd and the template's `command` starts it.
+    Image,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub enum EnvdUser {
+    /// Created on first start if the image lacks it.
+    #[default]
+    #[serde(rename = "lightspeed-envd")]
+    LightspeedEnvd,
+    /// For images where creating a user is impractical. Agent commands then
+    /// run as root, and the microVM is the only isolation boundary.
+    #[serde(rename = "root")]
+    Root,
 }
 
 /// How the provider reaches `lightspeed-envd` inside the guest.
@@ -143,7 +220,7 @@ pub enum EnvdChannel {
 impl Default for EnvdChannel {
     fn default() -> Self {
         Self::ExposedSocket {
-            guest_path: "/run/lightspeed/envd.sock".to_owned(),
+            guest_path: "/var/lib/lightspeed-envd/envd.sock".to_owned(),
         }
     }
 }
@@ -191,11 +268,18 @@ impl Config {
     pub fn from_json(bytes: &[u8]) -> anyhow::Result<Self> {
         let raw: RawConfig =
             serde_json::from_slice(bytes).context("decode provider config JSON")?;
-        if !raw.state_dir.is_absolute() {
+        let state_dir = match raw.state_dir {
+            Some(state_dir) => state_dir,
+            None => default_state_dir()?,
+        };
+        if !state_dir.is_absolute() {
             bail!("stateDir must be an absolute path")
         }
-        if raw.state_dir.as_os_str().len() > MAX_STATE_DIR_BYTES {
-            bail!("stateDir must be at most {MAX_STATE_DIR_BYTES} bytes so envd socket paths fit")
+        if state_dir.as_os_str().len() > MAX_STATE_DIR_BYTES {
+            bail!(
+                "stateDir {} is longer than {MAX_STATE_DIR_BYTES} bytes; envd socket paths would not fit",
+                state_dir.display()
+            )
         }
         let mut credentials = BTreeMap::new();
         for rule in raw.credentials {
@@ -213,8 +297,16 @@ impl Config {
         if raw.templates.is_empty() {
             bail!("provider must configure at least one template")
         }
+        let envd_binary = envd_binary(&raw.envd, std::env::consts::ARCH)?;
         let mut templates = BTreeMap::new();
         for template in raw.templates {
+            if template.envd_source == EnvdSource::Injected && envd_binary.is_none() {
+                bail!(
+                    "template {}: no envd binary configured for {} (envd.binaries)",
+                    template.template_id,
+                    std::env::consts::ARCH
+                )
+            }
             validate_template(&template, &credentials)
                 .with_context(|| format!("template {}", template.template_id))?;
             if templates
@@ -226,8 +318,9 @@ impl Config {
         }
         Ok(Self(Arc::new(ConfigInner {
             controller_listen: raw.controller_listen,
-            state_dir: raw.state_dir,
+            state_dir,
             smolvm: raw.smolvm,
+            envd_binary,
             templates,
             credentials,
             unknown_secret_env: raw.unknown_secret_env,
@@ -259,6 +352,40 @@ impl Config {
     }
 }
 
+/// Per-user default, so the provider runs as the user who owns the smolvm
+/// machines (smolvm keeps its machine database per user):
+/// `$XDG_STATE_HOME/lightspeed-provider-smolvm`, else
+/// `~/.local/state/lightspeed-provider-smolvm`; `%LOCALAPPDATA%` on Windows.
+fn default_state_dir() -> anyhow::Result<PathBuf> {
+    const NAME: &str = "lightspeed-provider-smolvm";
+    let non_empty = |key: &str| std::env::var_os(key).filter(|value| !value.is_empty());
+    if cfg!(windows) {
+        let base = non_empty("LOCALAPPDATA").context("LOCALAPPDATA is not set; set stateDir")?;
+        return Ok(PathBuf::from(base).join(NAME));
+    }
+    if let Some(base) = non_empty("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(base).join(NAME));
+    }
+    let home = non_empty("HOME").context("HOME is not set; set stateDir")?;
+    Ok(PathBuf::from(home).join(".local/state").join(NAME))
+}
+
+/// Validate every configured binary and pick the one for `arch`.
+fn envd_binary(config: &EnvdConfig, arch: &str) -> anyhow::Result<Option<EnvdBinary>> {
+    for (key, binary) in &config.binaries {
+        if !ENVD_ARCHES.contains(&key.as_str()) {
+            bail!("envd.binaries: unknown architecture {key}")
+        }
+        if !binary.path.is_absolute() {
+            bail!("envd.binaries.{key}.path must be absolute")
+        }
+        if !envd::is_sha256(&binary.sha256) {
+            bail!("envd.binaries.{key}.sha256 must be 64 lowercase hex digits")
+        }
+    }
+    Ok(config.binaries.get(arch).cloned())
+}
+
 fn validate_template(
     template: &TemplatePolicy,
     credentials: &BTreeMap<String, CredentialRule>,
@@ -266,8 +393,30 @@ fn validate_template(
     if template.template_id.is_empty() {
         bail!("template id must not be empty")
     }
-    if !template.image.contains("@sha256:") {
-        bail!("image must be pinned by digest (name@sha256:...)")
+    match template.local_archive() {
+        Some(_) => {
+            if !template
+                .image_sha256
+                .as_deref()
+                .is_some_and(envd::is_sha256)
+            {
+                bail!("a local image archive needs imageSha256 (64 lowercase hex digits)")
+            }
+        }
+        None if looks_local(&template.image) => {
+            bail!("local image archives must be absolute paths")
+        }
+        None => {
+            if !template.image.contains("@sha256:") {
+                bail!(
+                    "image must be pinned by digest (name@sha256:...) or be an absolute \
+                     path to a docker save archive"
+                )
+            }
+            if template.image_sha256.is_some() {
+                bail!("imageSha256 only applies to local image archives")
+            }
+        }
     }
     if template.cpus == Some(0) || template.memory_mib == Some(0) {
         bail!("cpus and memoryMib must be positive")
@@ -276,6 +425,28 @@ fn validate_template(
         && (!guest_path.starts_with('/') || guest_path.contains(':'))
     {
         bail!("envd guestPath must be an absolute guest path without ':'")
+    }
+    match template.envd_source {
+        EnvdSource::Injected => {
+            if !template.command.is_empty() {
+                bail!(
+                    "command is generated for an injected envd; set envdSource \"image\" to use your own"
+                )
+            }
+            // The path is spliced into the generated user-setup script.
+            if let EnvdChannel::ExposedSocket { guest_path } = &template.envd
+                && !guest_path
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+            {
+                bail!("envd guestPath may only contain letters, digits, '/', '.', '_' and '-'")
+            }
+        }
+        EnvdSource::Image => {
+            if template.envd_user != EnvdUser::default() {
+                bail!("envdUser only applies to an injected envd; the image chooses its own user")
+            }
+        }
     }
     for host in &template.egress.allow_hosts {
         validate_host(host)?;
@@ -286,6 +457,30 @@ fn validate_template(
         }
     }
     Ok(())
+}
+
+const ARCHIVE_SUFFIXES: [&str; 3] = [".tar", ".tar.gz", ".tgz"];
+
+/// What smolvm would read as a local source rather than a registry reference.
+fn looks_local(image: &str) -> bool {
+    image.starts_with('/')
+        || image.starts_with("./")
+        || image.starts_with("../")
+        || ARCHIVE_SUFFIXES
+            .iter()
+            .any(|suffix| image.ends_with(suffix))
+}
+
+impl TemplatePolicy {
+    /// The local `docker save` archive this template boots from, if any.
+    pub fn local_archive(&self) -> Option<&Path> {
+        let path = Path::new(&self.image);
+        (path.is_absolute()
+            && ARCHIVE_SUFFIXES
+                .iter()
+                .any(|suffix| self.image.ends_with(suffix)))
+        .then_some(path)
+    }
 }
 
 /// Same rule Lightspeed applies to credential binding names.
@@ -321,11 +516,15 @@ fn validate_host(host: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub(crate) fn test_config(state_dir: &Path) -> Config {
-    let json = include_str!("../config.example.json").replace(
-        "/var/lib/lightspeed-provider-smolvm",
-        state_dir.to_str().unwrap(),
-    );
-    Config::from_json(json.as_bytes()).expect("test config")
+    Config::from_json(with_state_dir(state_dir.to_str().unwrap()).as_bytes()).expect("test config")
+}
+
+#[cfg(test)]
+fn with_state_dir(state_dir: &str) -> String {
+    let mut json: serde_json::Value =
+        serde_json::from_str(include_str!("../config.example.json")).unwrap();
+    json["stateDir"] = state_dir.into();
+    json.to_string()
 }
 
 #[cfg(test)]
@@ -352,23 +551,101 @@ mod tests {
 
     #[test]
     fn unpinned_images_are_rejected() {
-        let json = EXAMPLE.replace(
-            "ghcr.io/example/lightspeed-envd@sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            "ghcr.io/example/lightspeed-envd:latest",
-        );
+        let json = with_image("ghcr.io/example/lightspeed-envd:latest", None);
         let error = Config::from_json(json.as_bytes()).unwrap_err();
         assert!(format!("{error:#}").contains("pinned by digest"));
     }
 
+    fn with_image(image: &str, sha: Option<&str>) -> String {
+        let mut json: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        json["templates"][0]["image"] = image.into();
+        if let Some(sha) = sha {
+            json["templates"][0]["imageSha256"] = sha.into();
+        }
+        json.to_string()
+    }
+
+    #[test]
+    fn local_archives_must_be_absolute_and_hash_pinned() {
+        let sha = "a".repeat(64);
+        let ok = Config::from_json(with_image("/images/envd.tar", Some(&sha)).as_bytes()).unwrap();
+        assert!(ok.templates["dev-small-v1"].local_archive().is_some());
+        assert!(Config::from_json(with_image("/images/envd.tar", None).as_bytes()).is_err());
+        assert!(Config::from_json(with_image("/images/envd.tar", Some("abc")).as_bytes()).is_err());
+        assert!(Config::from_json(with_image("./envd.tar", Some(&sha)).as_bytes()).is_err());
+        assert!(Config::from_json(with_image("envd.tar", Some(&sha)).as_bytes()).is_err());
+        let registry = "ghcr.io/x/y@sha256:".to_owned() + &"0".repeat(64);
+        assert!(Config::from_json(with_image(&registry, Some(&sha)).as_bytes()).is_err());
+    }
+
+    fn with_template(field: &str, value: serde_json::Value) -> String {
+        let mut json: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        json["templates"][0][field] = value;
+        json.to_string()
+    }
+
+    #[test]
+    fn injected_templates_get_a_generated_command() {
+        let config = Config::from_json(EXAMPLE.as_bytes()).unwrap();
+        let template = &config.templates["dev-small-v1"];
+        assert_eq!(template.envd_source, EnvdSource::Injected);
+        assert_eq!(template.envd_user, EnvdUser::LightspeedEnvd);
+        let error =
+            Config::from_json(with_template("command", serde_json::json!(["envd"])).as_bytes())
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("generated"));
+        let unsafe_path =
+            serde_json::json!({"kind": "exposedSocket", "guestPath": "/run/a b.sock"});
+        assert!(Config::from_json(with_template("envd", unsafe_path).as_bytes()).is_err());
+        let root = Config::from_json(with_template("envdUser", "root".into()).as_bytes()).unwrap();
+        assert_eq!(root.templates["dev-small-v1"].envd_user, EnvdUser::Root);
+        assert!(Config::from_json(with_template("envdUser", "agent".into()).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn image_templates_keep_their_own_command_and_user() {
+        let mut json: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        json["templates"][0]["envdSource"] = "image".into();
+        json["templates"][0]["command"] = serde_json::json!(["lightspeed-envd"]);
+        json.as_object_mut().unwrap().remove("envd");
+        let config = Config::from_json(json.to_string().as_bytes()).unwrap();
+        assert!(config.envd_binary.is_none());
+        json["templates"][0]["envdUser"] = "root".into();
+        assert!(Config::from_json(json.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn injected_templates_need_a_valid_binary_for_this_host() {
+        let mut json: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        json.as_object_mut().unwrap().remove("envd");
+        let error = Config::from_json(json.to_string().as_bytes()).unwrap_err();
+        assert!(format!("{error:#}").contains("no envd binary configured"));
+
+        let binary = |path: &str, sha: &str| EnvdBinary {
+            path: path.into(),
+            sha256: sha.to_owned(),
+        };
+        let sha = "a".repeat(64);
+        let config = |key: &str, value: EnvdBinary| EnvdConfig {
+            binaries: BTreeMap::from([(key.to_owned(), value)]),
+        };
+        let x86 = config("x86_64", binary("/opt/envd", &sha));
+        assert_eq!(
+            envd_binary(&x86, "x86_64").unwrap(),
+            Some(binary("/opt/envd", &sha))
+        );
+        assert_eq!(envd_binary(&x86, "aarch64").unwrap(), None);
+        assert!(envd_binary(&config("riscv64", binary("/opt/envd", &sha)), "x86_64").is_err());
+        assert!(envd_binary(&config("x86_64", binary("envd", &sha)), "x86_64").is_err());
+        assert!(envd_binary(&config("x86_64", binary("/opt/envd", "abc")), "x86_64").is_err());
+    }
+
     #[test]
     fn state_dir_must_be_absolute_and_short() {
-        let relative = EXAMPLE.replace("/var/lib/lightspeed-provider-smolvm", "state");
-        assert!(Config::from_json(relative.as_bytes()).is_err());
-        let long = EXAMPLE.replace(
-            "/var/lib/lightspeed-provider-smolvm",
-            &format!("/{}", "x".repeat(80)),
-        );
-        assert!(Config::from_json(long.as_bytes()).is_err());
+        assert!(Config::from_json(with_state_dir("state").as_bytes()).is_err());
+        let long = format!("/{}", "x".repeat(80));
+        assert!(Config::from_json(with_state_dir(&long).as_bytes()).is_err());
+        assert!(Config::from_json(with_state_dir("/tmp/lsvm").as_bytes()).is_ok());
     }
 
     #[test]

@@ -4,11 +4,15 @@
 //! machine without a record (record lost). Records are repaired. A machine
 //! without a record is re-recorded from its ownership labels when they are
 //! complete and its template still exists; otherwise it is reported and left
-//! alone, since nothing proves who owns it.
+//! alone, since nothing proves who owns it. Finally, staged envd binaries no
+//! machine mounts are removed.
+
+use std::collections::BTreeSet;
 
 use crate::{
     backend::{VmBackend, VmState},
     config::{Config, EnvdChannel},
+    envd,
     policy::{self, Ownership},
     store::{Lifecycle, Store, TargetRecord, now_ms},
 };
@@ -20,6 +24,8 @@ pub struct ReconcileReport {
     pub finished_closes: Vec<String>,
     pub recovered: Vec<String>,
     pub orphans: Vec<String>,
+    /// Staged envd directories removed because nothing references them.
+    pub removed_envd: Vec<String>,
 }
 
 pub async fn reconcile<B: VmBackend>(
@@ -80,6 +86,27 @@ pub async fn reconcile<B: VmBackend>(
             }
         }
     }
+
+    // Keep what any record or machine label names (orphans included, since
+    // their mounts are still live), plus the configured binary.
+    let mut keep: BTreeSet<String> = store
+        .list()
+        .await?
+        .into_iter()
+        .filter_map(|record| record.envd_sha256)
+        .collect();
+    keep.extend(
+        machines
+            .iter()
+            .filter_map(|machine| machine.labels.get(envd::LABEL_ENVD_SHA256).cloned()),
+    );
+    keep.extend(
+        config
+            .envd_binary
+            .iter()
+            .map(|binary| binary.sha256.clone()),
+    );
+    report.removed_envd = envd::collect_garbage(config.state_dir(), &keep).await?;
     Ok(report)
 }
 
@@ -107,6 +134,10 @@ fn recover(
         image: template.image.clone(),
         envd: template.envd.clone(),
         host_port: None,
+        envd_sha256: labels
+            .get(envd::LABEL_ENVD_SHA256)
+            .filter(|sha256| envd::is_sha256(sha256))
+            .cloned(),
         lifecycle: Lifecycle::Active,
         failure: None,
         created_at_ms: now,
@@ -152,7 +183,15 @@ mod tests {
         let orphan = policy::target_name("u", "b", "orphan", "i");
         backend.insert(&done_create, VmState::Running, BTreeMap::new());
         backend.insert(&closing, VmState::Running, BTreeMap::new());
-        backend.insert(&recovered, VmState::Running, labelled.labels());
+        let old_envd = "b".repeat(64);
+        let mut recovered_labels = labelled.labels();
+        recovered_labels.insert(envd::LABEL_ENVD_SHA256.to_owned(), old_envd.clone());
+        backend.insert(&recovered, VmState::Running, recovered_labels);
+        let current_envd = config.envd_binary.as_ref().unwrap().sha256.clone();
+        let stale_envd = "c".repeat(64);
+        for sha256 in [&old_envd, &current_envd, &stale_envd] {
+            std::fs::create_dir_all(envd::staged_dir(dir.path(), sha256)).unwrap();
+        }
         backend.insert(&orphan, VmState::Running, BTreeMap::new());
         backend.insert("someone-elses-vm", VmState::Running, BTreeMap::new());
 
@@ -171,6 +210,10 @@ mod tests {
         assert_eq!(backend.state_of(&closing), VmState::Missing);
         let record = store.get(&recovered).await.unwrap().unwrap();
         assert_eq!(record.ownership(), labelled);
+        assert_eq!(record.envd_sha256, Some(old_envd.clone()));
+        assert_eq!(report.removed_envd, vec![stale_envd.clone()]);
+        assert!(envd::staged_dir(dir.path(), &old_envd).exists());
+        assert!(envd::staged_dir(dir.path(), &current_envd).exists());
         assert_eq!(backend.state_of(&orphan), VmState::Running);
     }
 }

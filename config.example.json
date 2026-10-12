@@ -1,20 +1,26 @@
 {
   "controllerListen": "127.0.0.1:19190",
-  "stateDir": "/var/lib/lightspeed-provider-smolvm",
   "smolvm": {
     "binary": "smolvm",
     "commandTimeoutSeconds": 120
+  },
+  "envd": {
+    "binaries": {
+      "x86_64": {
+        "path": "/opt/lightspeed/lightspeed-envd-x86_64",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    }
   },
   "templates": [
     {
       "templateId": "dev-small-v1",
       "displayName": "Small development microVM",
-      "description": "2 vCPU, 2 GiB RAM; egress only to GitHub",
-      "image": "ghcr.io/example/lightspeed-envd@sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "command": ["lightspeed-envd", "--listen-unix", "/run/lightspeed/envd.sock", "--cwd", "/workspace"],
+      "description": "Ubuntu 24.04, 2 vCPU, 2 GiB RAM; egress only to GitHub",
+      "image": "ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55",
       "cpus": 2,
       "memoryMib": 2048,
-      "envd": { "kind": "exposedSocket", "guestPath": "/run/lightspeed/envd.sock" },
+      "envd": { "kind": "exposedSocket", "guestPath": "/var/lib/lightspeed-envd/envd.sock" },
       "egress": { "allowHosts": [] },
       "credentials": ["GITHUB_TOKEN"]
     }

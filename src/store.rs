@@ -52,6 +52,10 @@ pub struct TargetRecord {
     /// Host loopback port for `EnvdChannel::LoopbackForward`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_port: Option<u16>,
+    /// The staged envd the machine mounts, for an injected envd. A machine
+    /// keeps it for life: smolvm reuses the create-time mount on restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envd_sha256: Option<String>,
     pub lifecycle: Lifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
@@ -208,15 +212,23 @@ fn ensure_target_name(target_id: &str) -> anyhow::Result<()> {
 }
 
 async fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("create {}", dir.display()))?;
+    tokio::fs::create_dir_all(dir).await.with_context(|| {
+        format!(
+            "create {}: stateDir must be writable by the user running the provider",
+            dir.display()
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .await
-            .with_context(|| format!("restrict {}", dir.display()))?;
+            .with_context(|| {
+                format!(
+                    "restrict {}: it must be owned by the user running the provider",
+                    dir.display()
+                )
+            })?;
     }
     // Windows: the directory inherits ACLs from its parent; place stateDir
     // under a location only the provider account can read.
@@ -236,6 +248,7 @@ pub(crate) fn sample_record(target_id: &str) -> TargetRecord {
         image: "img@sha256:00".to_owned(),
         envd: EnvdChannel::default(),
         host_port: Some(40000),
+        envd_sha256: None,
         lifecycle: Lifecycle::Active,
         failure: None,
         created_at_ms: 1,
@@ -278,6 +291,15 @@ mod tests {
         store.remove(&first).await.unwrap();
         assert!(store.get(&first).await.unwrap().is_none());
         assert!(!store.vm_dir(&first).unwrap().exists());
+    }
+
+    #[test]
+    fn records_from_before_envd_injection_still_load() {
+        let mut json = serde_json::to_value(sample_record("ls-0123456789abcdef0123")).unwrap();
+        assert!(json.get("envdSha256").is_none());
+        json.as_object_mut().unwrap().remove("hostPort");
+        let record: TargetRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(record.envd_sha256, None);
     }
 
     #[tokio::test]

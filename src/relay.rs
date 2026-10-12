@@ -31,7 +31,7 @@ pub async fn proxy<B: VmBackend>(
     mut lightspeed: WebSocket,
     mut guest: GuestSocket,
 ) {
-    loop {
+    let reason = loop {
         let event = tokio::time::timeout(context.idle, async {
             tokio::select! {
                 message = lightspeed.recv() => Event::Lightspeed(message),
@@ -40,14 +40,14 @@ pub async fn proxy<B: VmBackend>(
         })
         .await;
         let Ok(event) = event else {
-            break;
+            break "idle timeout";
         };
         match event {
             Event::Lightspeed(Some(Ok(AxumMessage::Text(text)))) => {
                 match forward_request(&context, text.as_str()).await {
                     Outbound::Guest(frame) => {
                         if guest.send(GuestMessage::Text(frame.into())).await.is_err() {
-                            break;
+                            break "envd send failed";
                         }
                     }
                     Outbound::Lightspeed(response) => {
@@ -56,15 +56,19 @@ pub async fn proxy<B: VmBackend>(
                             .await
                             .is_err()
                         {
-                            break;
+                            break "lightspeed send failed";
                         }
                     }
                 }
             }
             Event::Lightspeed(Some(Ok(message))) => {
                 let close = matches!(message, AxumMessage::Close(_));
-                if guest.send(to_guest(message)).await.is_err() || close {
-                    break;
+                if close {
+                    let _ = guest.send(to_guest(message)).await;
+                    break "lightspeed closed";
+                }
+                if guest.send(to_guest(message)).await.is_err() {
+                    break "envd send failed";
                 }
             }
             Event::Guest(Some(Ok(message))) => {
@@ -72,13 +76,21 @@ pub async fn proxy<B: VmBackend>(
                 let Some(message) = to_lightspeed(message) else {
                     continue;
                 };
-                if lightspeed.send(message).await.is_err() || close {
-                    break;
+                if close {
+                    let _ = lightspeed.send(message).await;
+                    break "envd closed";
+                }
+                if lightspeed.send(message).await.is_err() {
+                    break "lightspeed send failed";
                 }
             }
-            Event::Lightspeed(_) | Event::Guest(None) | Event::Guest(Some(Err(_))) => break,
+            Event::Lightspeed(None) => break "lightspeed disconnected",
+            Event::Lightspeed(Some(Err(_))) => break "lightspeed read error",
+            Event::Guest(None) => break "envd disconnected",
+            Event::Guest(Some(Err(_))) => break "envd read error",
         }
-    }
+    };
+    tracing::info!(reason, "data route closed");
     // Close both legs so an upstream EOF never becomes a bare reset in envd.
     let _ = guest.close(None).await;
     let _ = lightspeed.send(AxumMessage::Close(None)).await;
@@ -92,7 +104,10 @@ enum Outbound {
 async fn forward_request<B: VmBackend>(context: &RelayContext<B>, text: &str) -> Outbound {
     match credentials::rewrite_frame(text, &context.rules, context.unknown) {
         Rewrite::Unchanged => Outbound::Guest(text.to_owned()),
-        Rewrite::Rejected { response } => Outbound::Lightspeed(response),
+        Rewrite::Rejected { response } => {
+            tracing::warn!("rejected request carrying a secret with no credential rule");
+            Outbound::Lightspeed(response)
+        }
         Rewrite::Rewritten {
             id,
             frame,
@@ -104,7 +119,7 @@ async fn forward_request<B: VmBackend>(context: &RelayContext<B>, text: &str) ->
         {
             Ok(()) => Outbound::Guest(frame),
             Err(error) => {
-                tracing::warn!(target_id = %context.target_id, %error, "credential supply failed");
+                tracing::warn!(error = format!("{error:#}"), "credential supply failed");
                 Outbound::Lightspeed(credentials::error_response(
                     id,
                     EnvironmentProtocolErrorCode::CapabilityUnavailable,

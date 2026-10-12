@@ -5,7 +5,10 @@ use std::{collections::BTreeMap, path::Path};
 use async_trait::async_trait;
 use environment_protocol::shared::SecretString;
 
-use crate::config::{CredentialRule, TemplatePolicy};
+use crate::{
+    config::{CredentialRule, TemplatePolicy},
+    envd::EnvdMount,
+};
 
 /// Observed machine state, before envd readiness is considered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +44,8 @@ pub struct VmSpec<'a> {
     pub vm_dir: &'a Path,
     /// Host port for a `LoopbackForward` envd channel.
     pub host_port: Option<u16>,
+    /// The staged envd an `injected` template mounts.
+    pub envd: Option<EnvdMount>,
 }
 
 #[async_trait]

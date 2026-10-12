@@ -11,12 +11,14 @@ pub mod backend;
 pub mod channel;
 pub mod config;
 pub mod credentials;
+pub mod envd;
 pub mod policy;
 pub mod reconcile;
 pub mod relay;
 pub mod server;
 pub mod smolvm;
 pub mod store;
+pub mod telemetry;
 
 pub use backend::VmBackend;
 pub use config::{Config, ProviderArgs};
