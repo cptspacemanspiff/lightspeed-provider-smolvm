@@ -372,6 +372,7 @@ mod tests {
                 allow_hosts: allow_hosts.iter().map(|host| host.to_string()).collect(),
             },
             credentials: Vec::new(),
+            display: false,
             deprecated: false,
         }
     }

@@ -174,6 +174,11 @@ pub struct TemplatePolicy {
     /// Their hosts are added to the egress allowlist.
     #[serde(default)]
     pub credentials: Vec<String>,
+    /// The image runs a graphical session that envd can observe and drive.
+    /// Reported to Lightspeed as the `display` capability, which offers
+    /// display tools to sessions attached to machines from this template.
+    #[serde(default)]
+    pub display: bool,
     #[serde(default)]
     pub deprecated: bool,
 }

@@ -703,13 +703,10 @@ async fn summary_of<B: VmBackend>(app: &App<B>, record: TargetRecord) -> Provide
     if let Some(failure) = &record.failure {
         metadata.insert("failure".to_owned(), failure.clone());
     }
-    let network = app
-        .config
-        .templates
-        .get(&record.template_id)
-        .is_some_and(|template| {
-            !template.egress.allow_hosts.is_empty() || !template.credentials.is_empty()
-        });
+    let template = app.config.templates.get(&record.template_id);
+    let network = template.is_some_and(|template| {
+        !template.egress.allow_hosts.is_empty() || !template.credentials.is_empty()
+    });
     let mut capabilities = EnvironmentCapabilities::filesystem(true, true)
         .with_filesystem_search()
         .with_process()
@@ -721,6 +718,7 @@ async fn summary_of<B: VmBackend>(app: &App<B>, record: TargetRecord) -> Provide
     capabilities.filesystem_ranged_read = true;
     capabilities.process_output_notifications = false;
     capabilities.process_pty = true;
+    capabilities.display = template.is_some_and(|template| template.display);
     ProviderTargetSummary {
         target_id: ProviderTargetId::new(record.target_id),
         display_name: Some(record.environment_id),
@@ -824,6 +822,27 @@ mod tests {
         let record = app.store.get(name).await.unwrap().unwrap();
         assert_eq!(record.envd_sha256, Some(sha256));
         assert!(app.store.secrets_dir(name).unwrap().is_dir());
+    }
+
+    #[tokio::test]
+    async fn only_display_templates_report_the_display_capability() {
+        let (app, _dir) = app().await;
+        let headless = create_target(&app, Ok(create_params("e1", "r1")))
+            .await
+            .unwrap();
+        assert!(!headless.target.capabilities.display);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut json: Value = serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        json["stateDir"] = dir.path().to_str().unwrap().into();
+        json["templates"][0]["display"] = true.into();
+        let config = Config::from_json(json.to_string().as_bytes()).unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let app = App::new(config, FakeBackend::default(), store);
+        let desktop = create_target(&app, Ok(create_params("e2", "r2")))
+            .await
+            .unwrap();
+        assert!(desktop.target.capabilities.display);
     }
 
     #[tokio::test]
