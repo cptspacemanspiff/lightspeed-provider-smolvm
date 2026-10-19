@@ -13,7 +13,8 @@
 #
 # LIGHTSPEED_DIR overrides the Lightspeed checkout envd is built from (default:
 # the sibling ../lightspeed), SMOLVM_HOME the smolvm install (default:
-# ~/.smolvm).
+# ~/.smolvm). LIGHTSPEED_ENVD is a static envd to stage instead of building one,
+# such as the dist/bin/lightspeed-envd of a Lightspeed release build.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -25,7 +26,11 @@ dist=$here/dist
 
 die() { echo "docker/stage: $*" >&2; exit 1; }
 
-[ -d "$lightspeed" ] || die "$lightspeed not found (set LIGHTSPEED_DIR)"
+if [ -n "${LIGHTSPEED_ENVD:-}" ]; then
+    [ -x "$LIGHTSPEED_ENVD" ] || die "LIGHTSPEED_ENVD: $LIGHTSPEED_ENVD is not an executable"
+else
+    [ -d "$lightspeed" ] || die "$lightspeed not found (set LIGHTSPEED_DIR)"
+fi
 for f in smolvm smolvm-bin lib storage-template.ext4.zst overlay-template.ext4.zst; do
     [ -e "$smolvm_home/$f" ] || die "not found: $smolvm_home/$f (install smolvm, or set SMOLVM_HOME)"
 done
@@ -39,13 +44,20 @@ echo "==> building lightspeed-provider-smolvm"
 (cd "$provider" && cargo build --quiet --release --bin lightspeed-provider-smolvm)
 cp "$provider/target/release/lightspeed-provider-smolvm" "$dist/bin/"
 
-build=$(mktemp -d)
-trap 'rm -rf "$build"' EXIT
-LIGHTSPEED_DIR=$lightspeed OUT_DIR=$build "$provider/scripts/build-envd.sh" >/dev/null
-envd=$(cd "$build" && ls lightspeed-envd-*)
-cp "$build/$envd" "$dist/envd/"
 arch=$(uname -m)
-sha=$(sha256sum "$dist/envd/$envd" | cut -d' ' -f1)
+if [ -n "${LIGHTSPEED_ENVD:-}" ]; then
+    sha=$(sha256sum "$LIGHTSPEED_ENVD" | cut -d' ' -f1)
+    # Named by content, as build-envd.sh names its builds.
+    envd=lightspeed-envd-$arch-${sha:0:12}
+    install -m 0755 "$LIGHTSPEED_ENVD" "$dist/envd/$envd"
+else
+    build=$(mktemp -d)
+    trap 'rm -rf "$build"' EXIT
+    LIGHTSPEED_DIR=$lightspeed OUT_DIR=$build "$provider/scripts/build-envd.sh" >/dev/null
+    envd=$(cd "$build" && ls lightspeed-envd-*)
+    cp "$build/$envd" "$dist/envd/"
+    sha=$(sha256sum "$dist/envd/$envd" | cut -d' ' -f1)
+fi
 cat >"$dist/envd/envd.json" <<EOF
 { "binaries": { "$arch": { "path": "/opt/lightspeed/envd/$envd", "sha256": "$sha" } } }
 EOF
